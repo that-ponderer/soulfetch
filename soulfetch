@@ -1264,6 +1264,12 @@ draw(){
 # }}}
 
 # Hooks {{{
+clean_cache(){
+    local cache
+    for cache in "$cache_files"* ; do
+        rm -rf "$cache" 2> /dev/null
+    done
+}
 DEINIT(){
     # Move cursor to the end of the output
     local frame_height
@@ -1277,10 +1283,7 @@ DEINIT(){
         wait "$pid" 2> /dev/null
     done
     # Remove caches
-    local cache
-    for cache in "$cache_files"* ; do
-        rm -rf "$cache" 2> /dev/null
-    done
+    clean_cache
     # restore ^C printing
     stty echoctl
 }
@@ -1289,7 +1292,7 @@ INIT() {
     for cache in "$cache_files"* ; do
         [[ -s "$cache" ]] && \
             printf '%b' '\e[32m*\e[0m An instance is already running...\n' && \
-            exit 1
+            clean_cache ; exit 1
     done
     # Hide cursor
     printf "\e[?25l"
