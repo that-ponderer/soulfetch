@@ -969,8 +969,7 @@ $(whoami)\e[1;34;100m\e[1;90;40m\e[0m\n\n"
                                    -e weston)
             fi
             # Rename window managers to their proper values.
-            [[ $wm == *WINDOWMAKER* ]] && wm=wmaker
-            [[ $wm == *GNOME*Shell* ]] && wm=Mutter
+            [[ $wm == *gnome*shell* ]] && wm=Mutter
             wm=${wm:-unknown}
 
             printf '%s' "$wm"
