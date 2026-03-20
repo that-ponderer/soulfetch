@@ -1326,6 +1326,7 @@ INIT() {
     for cache in "$cache_files"* ; do
         [[ -s "$cache" ]] && \
             printf '%b' '\e[32m*\e[0m An instance is already running...\n' && \
+            printf '%b' '\e[32m*\e[0m Trying to clean up cache files...\n' && \
             clean_cache ; exit 1
     done
     # Hide cursor
