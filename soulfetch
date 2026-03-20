@@ -1,0 +1,1349 @@
+#!/usr/bin/env bash
+
+# ext utilities: lspci nvidia-smi intel_gpu_top getcap setcap sudo tail df 
+# which mkdir sleep lsof fuser ps xprop uname whoami rm kill ip
+
+shopt -s extglob nullglob checkwinsize
+
+## Dynamic vars
+# =============================================================
+# Updated by deamons running in subshells, have no use for the parent shell
+declare cpu # name
+declare cpu_temp # centigrade
+declare cpu_speed # Mhz
+declare cpu_speed_min # Mhz
+declare cpu_speed_max # Mhz
+declare cpu_count # num
+declare cpu_usage # 10 * percent
+declare total_memory # KiB
+declare memory_used # KiB
+declare -A gpu_arr # pcie_bus_id:name
+declare -A gpu_temp_arr # pcie_bus_id:centigrade
+declare -A gpu_usage_arr # pcie_bus_id:percent
+declare -A total_vram_arr # MiB
+declare -A vram_usage_arr # MiB
+declare -A fan_speed_arr # fan_name:rpm
+declare -A disk_sizes_arr # device:KiB
+declare -A disk_usages_arr # device:KiB
+declare -A disk_mount_point_arr # device:mp
+declare -A net_dev_state  # dev:state
+declare -A net_link_state  # dev:link_state
+declare -A net_ip_addr # dev:ip ...
+declare -A net_gate # dev:dest-gateway ...
+declare -A net_up_speed # dev:bytes
+declare -A net_down_speed #dev:bytes
+declare frame_height=0 #lines
+# -------------------------------------------------------------
+
+## Cache File 
+# =======================================================
+# For async IO
+if [[ -n "$XDG_CACHE_HOME" ]] ; then
+    declare cache_files="$XDG_CACHE_HOME/soulfetch_cache"
+    mkdir -p "$XDG_CACHE_HOME"
+else
+    declare cache_files="$HOME/.cache/soulfetch_cache"
+    mkdir -p "$HOME/.cache"
+fi
+declare cpu_cache_file="${cache_files}[cpu]"
+declare memory_cache_file="${cache_files}[memory]"
+declare gpu_cache_file="${cache_files}[gpu]"
+declare fan_cache_file="${cache_files}[fan]"
+declare disk_cache_file="${cache_files}[disk]"
+declare info_cache_file="${cache_files}[info]"
+declare net_cache_file="${cache_files}[net]"
+declare logo_cache_file="${cache_files}[logo]"
+declare frame_cache_file="${cache_files}[frame]"
+declare frame_height_cache_file="${cache_files}[frame_height]"
+# --------------------------------------------------------
+
+# Vars used in the parent script --------
+declare -a daemon_PID_arr
+declare logo_width=8
+# ---------------------------------------
+
+# Math {{{
+# Dynamic variables -------------------------------------------
+declare VEC2
+declare X
+declare Y
+declare R
+
+declare SQRT
+# Generated variables -----------------------------------------
+declare -a SIN_TABLE
+
+# Consts -----------------------------------------------------
+readonly PI=31416 # π * 10000
+readonly TWO_PI=$(( PI * 2 ))
+readonly SIN_RANGE=100  # range of sin(x)=(-SIN_RANGE,+SIN_RANGE)
+readonly SIN_DENSITY=100 # more points, more accurate
+
+# Arithmetic -------------------------------------------------
+sqrt() {
+    # Babylonian method for square root
+    # ---------------------------------
+    local n=$1
+    # we are taking the value itself as the 
+    # first estimation which is less then ideal
+    local x=$n
+    local y=$(( (x + 1) / 2 ))
+
+    while (( y < x )); do
+        x=$y
+        y=$(( (x + n / x) / 2 ))
+    done
+
+    SQRT="$x"
+}
+# Vec2 -------------------------------------------------------
+vec2_pack() {
+    # Packs two integers into a vector: (x,y)
+    local x="${1:-0}"
+    local y="${2:-0}"
+    VEC2="($x,$y)"
+}
+vec2_unpack() {
+    # Unpacks into two integers: X Y 
+    local vec="${1:-(0,0)}"
+    local regex='^\(([0-9]+),([0-9]+)\)$' # does not match wp: (123, 456)
+    [[ "$vec" =~ $regex ]]
+    local x="${BASH_REMATCH[1]}"
+    [[ -z "$x" ]] && x=0
+    local y="${BASH_REMATCH[2]}"
+    [[ -z "$y" ]] && y=0
+    X="$x" 
+    Y="$y"
+}
+vec2_add(){
+    # Add 2 vectors
+    local vec2_1="$1"
+    local vec2_2="$2"
+    vec2_unpack "$vec2_1"
+    local x1="$X"
+    local y1="$Y"
+    vec2_unpack "$vec2_2"
+    local x2="$X"
+    local y2="$Y"
+
+    local x3=$(( x1 + x2 ))
+    local y3=$(( y1 + y2 ))
+    vec2_pack $x3 $y3
+}
+vec2_dist(){
+    # Calculate the dist between vectors: R
+    local vec2_1="$1"
+    local vec2_2="$2"
+    vec2_unpack "$vec2_1"
+    local x1="$X"
+    local y1="$Y"
+    vec2_unpack "$vec2_2"
+    local x2="$X"
+    local y2="$Y"
+    sqrt "$(( ((x2 - x1) ** 2) + ((y2 - y1) ** 2) ))"
+    R="$SQRT"
+}
+# Trigo ------------------------------------------------------
+gen_sin_table() {
+    # Map SIN_DENSITY number of values around the circle (TWO_PI:360 deg)
+    # Value will be: 0 -> TWO_PI 
+    for ((i=0; i<SIN_DENSITY; i++)); do
+        # -----------------------------
+        # SIN_DENSITY < TWO_PI
+        # We can't map a bigger number to a smaller one 
+        # without floats
+        # -----------------------------
+        local x=$(( i * TWO_PI / SIN_DENSITY ))
+        local sign=1
+        # Make half the values neg
+        # -PI -> 0 -> PI
+        if (( x > PI )); then
+            x=$(( x - PI ))
+            sign=-1
+        fi
+        # ------------------------
+        # Now we have SIN_DENSITY number of values in radians
+        # That are signed and map around the whole circle
+        # ------------------------
+        # Bhāskara I approximation
+        # sin(x) ≈ 16x(π-x) / (5π² - 4x(π-x))
+        # x:angle in radians
+
+        local num=$(( 16 * x * (PI - x) ))
+        local den=$(( 5 * PI * PI - 4 * x * (PI - x) ))
+        if (( den == 0 )); then
+            local value=0
+        else
+            # num / dev = (-1,1)
+            # so we scale that with SIN_RANGE
+            local value=$(( num * SIN_RANGE / den ))
+        fi
+        SIN_TABLE+=( $(( value * sign )) )
+    done
+}
+gen_sin_table
+# }}}
+
+# Helpers {{{
+bash_sleep() {
+    # sleep while boggig the cpu down
+    local ms="$1"
+    local start="${EPOCHREALTIME/./}"
+    while true ; do
+        local end="${EPOCHREALTIME/./}"
+        local diff=$(( (end - start ) / 1000 )) 
+        (( diff > ms )) && break
+    done
+}
+trim() {
+    local var="$1"
+    trimmed="${var#"${var%%[![:space:]]*}"}"
+    trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+}
+normalize_spaces() {
+    local str="$*"
+    # dont qoute, we need the word splitting
+    # bash excludes the spaces and takes only 
+    # the words as arguments
+    set -- $str
+    normalized_str="$*"
+}
+get_cursor_pos() {
+    local response
+    # Ask terminal (DSR) for cursor position
+    printf '\e[6n'
+    # Terminal responds in stdin: ESC[row;colR
+    # -s -> silent mode: dont print anything while reading (precaution)
+    # -r -> stop mangling backslashes (shellcheck keeps screaming)
+    # -dR -> stop reading at R
+    read -srdR response
+    # response looks like: ESC[12;40
+    # Match digits;digits at the end
+    local regex='\[([0-9]+);([0-9]+)$'
+    if [[ $response =~  $regex ]] ; then
+        vec2_pack "${BASH_REMATCH[2]}" "${BASH_REMATCH[1]}"
+        CURSOR_POS="$VEC2"
+    fi
+}
+# }}}
+
+# CPU {{{
+get_cpu() {
+    # Get cpu info and count
+    local cpu_file="/proc/cpuinfo"
+    local break_counter=2
+    while IFS= read -r line ; do
+        (( break_counter <= 0 )) && break
+        if [[ "$line" == 'model name'* ]] ; then
+            local tmp1="${line%@*}"  
+            local tmp2="${tmp1#*:}"
+            trim "$tmp2"
+            cpu="$trimmed"
+            (( break_counter-- ))
+        elif [[ "$line" == 'siblings'* ]] ; then
+            local tmp1="${line#*:}"
+            trim "$tmp1"
+            cpu_count="$trimmed"
+            (( break_counter-- ))
+        fi
+    done < "$cpu_file" || return 0
+}
+get_cpu_dynamic() {
+    local interval="${1}"
+    # cpu speed
+    # ---------------------------------------------
+    # Tip: /sys/devices/ : 
+    #           real device tree based on actual hardware hierarchy
+    #           and how the kernel sees them
+    #      /sys/class/ : 
+    #           grouping of all devices based of type, no hierarchy,
+    #           made for convinence
+    local speed_dir="/sys/devices/system/cpu/cpu0/cpufreq"
+    cpu_speed="$(( $( < "${speed_dir}/cpuinfo_avg_freq" ) / 1000 ))"
+    cpu_speed_max="$(( $( < "${speed_dir}/cpuinfo_max_freq" ) / 1000 ))"
+    cpu_speed_min="$(( $( < "${speed_dir}/cpuinfo_min_freq" ) / 1000 ))"
+    # Select the right temperature file.
+    # ---------------------------------
+    # hwmon: The hardware monitoring subsystem
+    # provides info like temp,fan speed,voltage
+    for temp_dir in /sys/class/hwmon/*; do
+        [[ "$(< "${temp_dir}/name")" =~ \
+        (cpu_thermal|coretemp|fam15h_power|k10temp) ]] && {
+            local temp_dirs=("$temp_dir"/temp*_input)
+            local temp_file=${temp_dirs[0]}
+            break
+        }
+    done
+    # get temp in deg
+    cpu_temp="$(( "$( < "$temp_file" )" / 1000 ))"
+    # cpu usage
+    # -------------------------------------
+    # read only the first line, it contains the avarage
+    # then calculate the diff in idle time and total time 
+    # to the the diff in active time
+    local usage_file="/proc/stat"
+    local cpu user nice system idle iowait irq softirq steal guest guest_nice
+    read -r cpu user nice system idle iowait irq softirq steal guest guest_nice \
+        < "$usage_file"
+    local idle1=$((idle + iowait))
+    local total1=$((user + nice + system + idle + iowait + irq + softirq + steal))
+    sleep "$interval"
+    read -r cpu user nice system idle iowait irq softirq steal guest guest_nice \
+        < "$usage_file"
+    local idle2=$((idle + iowait))
+    local total2=$((user + nice + system + idle + iowait + irq + softirq + steal))
+    local total_delta=$((total2 - total1))
+    local idle_delta=$((idle2 - idle1))
+    cpu_usage=$(( 1000 * (total_delta - idle_delta) / total_delta ))
+}
+cpu_daemon(){
+    get_cpu
+    while true ; do
+        get_cpu_dynamic 1
+        local cpu_data="
+cpu,$cpu
+cpu_count,$cpu_count
+cpu_usage,$cpu_usage
+cpu_temp,$cpu_temp
+cpu_speed,$cpu_speed
+cpu_speed_min,$cpu_speed_min
+cpu_speed_max,$cpu_speed_max
+"
+        printf '%s' "$cpu_data" > "$cpu_cache_file"    
+    done
+}
+# }}}
+
+# Memory {{{
+get_memory_dynamic(){
+    local interval=${1}
+    local memory_file="/proc/meminfo"
+
+    while IFS=":" read -r key value; do
+        case $key in
+            "MemTotal") 
+                total_memory="${value/kB}" ;;
+            "MemAvailable")
+                memory_used="$(( total_memory - ${value/kB} ))"
+            ;;
+        esac
+    done < "$memory_file"
+
+    trim "$total_memory"
+    total_memory="$trimmed"
+    trim "$memory_used"
+    memory_used="$trimmed"
+
+    sleep "$interval"
+}
+memory_daemon(){
+    while true ; do
+        get_memory_dynamic 1 
+        local memory_data="
+memory_used,$memory_used
+total_memory,$total_memory
+" 
+# `read` does not read the last line if it does not include a newline
+        printf '%s' "$memory_data" > "$memory_cache_file"    
+    done
+}
+# }}}
+
+# GPU {{{
+declare can_get_gpu
+declare -a nvidia_gpus
+declare -a intel_gpus
+declare has_NVIDIA=false
+declare has_Intel=false
+declare intel_daemon_running=false
+
+init_gpu(){
+    if ! [[ -x $(which lspci 2> /dev/null) ]] ; then
+        can_get_gpu=false
+    else
+        can_get_gpu=true
+    fi
+}
+get_gpu() {
+    local gpu_command="lspci -mm"
+    declare -A gpu_raw
+    while IFS='"' read -ra parts ; do
+        if [[ "${parts[1]}" == +(VGA*|Display*|3D*) ]] ; then
+            trim "${parts[0]}"
+            gpu_raw["${trimmed}"]="${parts[3]} ${parts[5]}"
+        fi
+    done < <( $gpu_command )
+    for key in "${!gpu_raw[@]}" ; do
+        case "${gpu_raw[$key]}" in
+            *"Advanced"*)
+                brand="${gpu_raw[$key]/*AMD*ATI*/AMD ATI}"
+                brand="${brand:-${gpu_raw[$key]/*AMD*/AMD}}"
+                brand="${brand:-${gpu_raw[$key]/*ATI*/ATi}}"
+
+                gpu_raw[$key]="${gpu_raw[$key]/\[AMD\/ATI\] }"
+                gpu_raw[$key]="${gpu_raw[$key]/\[AMD\] }"
+                gpu_raw[$key]="${gpu_raw[$key]/OEM }"
+                gpu_raw[$key]="${gpu_raw[$key]/Advanced Micro Devices, Inc.}"
+                gpu_raw[$key]="${gpu_raw[$key]/*\[}"
+                gpu_raw[$key]="${gpu_raw[$key]/\]*}"
+                gpu_raw[$key]="$brand ${gpu_raw[$key]}"
+            ;;
+
+            *"NVIDIA"*)
+                gpu_raw[$key]="${gpu_raw[$key]/*\[}"
+                gpu_raw[$key]="${gpu_raw[$key]/\]*}"
+                gpu_raw[$key]="NVIDIA ${gpu_raw[$key]}"
+            ;;
+
+            *"Intel"*)
+                gpu_raw[$key]="${gpu_raw[$key]/*Intel/Intel}"
+                gpu_raw[$key]="${gpu_raw[$key]/\(R\)}"
+                gpu_raw[$key]="${gpu_raw[$key]/Corporation}"
+                gpu_raw[$key]="${gpu_raw[$key]/ \(*}"
+                gpu_raw[$key]="${gpu_raw[$key]/Integrated Graphics Controller}"
+                gpu_raw[$key]="${gpu_raw[$key]/*Xeon*/Intel HD Graphics}"
+            ;;
+
+            *"MCST"*)
+                gpu_raw[$key]="${gpu_raw[$key]/*MCST*MGA2*/MCST MGA2}"
+            ;;
+
+            *"VirtualBox"*)
+                gpu_raw[$key]="VirtualBox Graphics Adapter"
+            ;;
+
+            *) return ;;
+        esac
+        normalize_spaces "${gpu_raw[$key]}"
+        gpu_arr[$key]="${normalized_str}"
+    done
+}
+init_gpu_dynamic(){
+    # Super sketchy need better ways -------------------------
+    for bus_id in "${!gpu_arr[@]}" ; do 
+        if [[ "${gpu_arr[$bus_id]}" == NVIDIA* ]] ; then 
+            nvidia_gpus+=( "$bus_id" )
+        elif [[ "${gpu_arr[$bus_id]}" == Intel* ]] ; then 
+            intel_gpus+=( "$bus_id" )
+        fi
+    done
+    # --------------------------------------------------------
+    if [[ -n "${nvidia_gpus[*]}" ]] ; then
+        if ! [[ -x $(which nvidia-smi  2> /dev/null) ]] ; then
+            return 1
+        else
+            has_NVIDIA=true
+        fi
+    fi
+    if [[ -n "${intel_gpus[*]}" ]] ; then
+        if ! [[ -x $(which intel_gpu_top  2> /dev/null) ]] ; then
+            return 1
+        else
+            if ! [[ "$(getcap "$(which intel_gpu_top)")" == *cap_perfmon=ep* ]]
+            then
+                return 1
+            else
+                has_Intel=true
+            fi
+        fi
+    fi
+}
+get_gpu_dynamic() {
+    local interval="${1}"
+
+    NVIDIA() {
+        # pcie_bus_id: It's the location of the device on the PCI/PCIe bus 
+        #              hierarchy
+        # format:      domain:bus:device.function
+        # Domain:      The PCI domain separates completely independent PCI 
+        #              hierarchies. Most consumer systems have only one domain
+        # Bus:         The CPU/root complex starts with bus 00, then PCI bridges 
+        #              create new buses.
+        # Device:      Each bus can have 32 devices:
+        # Function:    Each device can have up to 8 functions:
+        local pcie_bus_id util mem_used total_mem temp
+        while IFS=, read -r pcie_bus_id util mem_used total_mem temp ; do 
+            # -----------------------------
+            pcie_bus_id="${pcie_bus_id#*:}"
+            trim "$pcie_bus_id"
+            pcie_bus_id="$trimmed"
+            # -----------------------------
+            trim "$util"
+            util="$trimmed"
+            gpu_usage_arr["$pcie_bus_id"]="$util"
+            # -----------------------------
+            trim "$mem_used"
+            mem_used="$trimmed"
+            vram_usage_arr["$pcie_bus_id"]="$mem_used"
+            # -----------------------------
+            trim "$total_mem"
+            total_mem="$trimmed"
+            total_vram_arr["$pcie_bus_id"]="$total_mem"
+            # -----------------------------
+            trim "$temp"
+            temp="$trimmed"
+            gpu_temp_arr["$pcie_bus_id"]="$temp"
+            # -----------------------------
+        done < <(nvidia-smi \
+--query-gpu=pci.bus_id,utilization.gpu,memory.used,memory.total,temperature.gpu \
+            --format=csv,noheader,nounits)
+    }
+    
+    INTEL(){
+        local temp_file="${cache_files}[Intel]"
+        if ! $intel_daemon_running ; then
+            for pcie_bus_id in "${intel_gpus[@]}"; do
+                intel_gpu_top -c -s "$((  interval * 1000 ))" -d  \
+                    "sys:/sys/devices/pci0000:00/0000:$pcie_bus_id" \
+                    > "$temp_file" &
+                daemon_PID_arr+=( $! )
+                temp_file_arr+=( "$temp_file" )
+            done
+        fi
+        intel_daemon_running=true
+        
+        local Freq_req Freq_act IRQ RC6 render_usage
+        for pcie_bus_id in "${intel_gpus[@]}" ; do 
+            while IFS=, read -r Freq_req Freq_act IRQ RC6 \
+                Power_gpu Power_pkg RCS rest ; do
+                # Intel GPUs have different hardware engines, 
+                # each doing different tasks. 
+                # RCS: Usage of the main 3D rendering engine.
+                # BCS: Blitter Copy Engine
+                # VCS: Video Codec Engine
+                # VECS: Video Enhancement Engine
+                if [[ "$Freq_req" == "Freq MHz req" ]] ; then continue ; fi
+                render_usage="${RCS}"
+                gpu_usage_arr["$pcie_bus_id"]="${render_usage/.*}"
+            done < <(tail -n 1 "$temp_file")
+        done
+    }
+    
+    sleep "$interval"
+    $has_NVIDIA && NVIDIA
+    $has_Intel && INTEL
+}
+gpu_daemon(){
+    init_gpu
+    # keep atleast somthing running so you dont end
+    # up killing some poor random unrelated process 
+    $can_get_gpu || { while true ; do sleep 1000 ; done ; }
+    get_gpu
+    init_gpu_dynamic
+    while true ; do
+        get_gpu_dynamic 1
+        local gpu_data=""
+        for key in "${!gpu_arr[@]}" ; do
+            gpu_data+="gpu,$key,${gpu_arr[$key]}\n"
+        done
+        for key in "${!gpu_temp_arr[@]}" ; do
+            gpu_data+="gpu_temp,$key,${gpu_temp_arr[$key]}\n"
+        done
+        for key in "${!gpu_usage_arr[@]}" ; do
+            gpu_data+="gpu_usage,$key,${gpu_usage_arr[$key]}\n"
+        done
+        for key in "${!total_vram_arr[@]}" ; do
+            gpu_data+="total_vram,$key,${total_vram_arr[$key]}\n"
+        done
+        for key in "${!vram_usage_arr[@]}" ; do
+            gpu_data+="vram_usage,$key,${vram_usage_arr[$key]}\n"
+        done
+        printf '%b' "$gpu_data" > "$gpu_cache_file"    
+    done
+}
+# }}}
+
+# Fan {{{
+get_fan_speed_dynamic(){
+    local interval=${1}
+    local -A fan_input_files
+
+    for dev in /sys/class/hwmon/* ; do
+        for file in "$dev"/* ; do
+            if [[ "$file" == */fan*input ]] ; then
+                local value="$file"
+                local key="${file/*'/'}"
+                key="${key/_*}"
+                fan_input_files["$key"]="$file"
+            fi
+        done
+    done
+    
+    [[ -z "${fan_input_files[*]}" ]] && return 1
+    for fan in "${!fan_input_files[@]}" ; do 
+        fan_speed_arr["$fan"]="$(< "${fan_input_files[$fan]}")"
+    done
+    sleep "$interval"
+}
+fan_daemon(){
+    while true ; do
+        get_fan_speed_dynamic 1
+        local fan_data=""
+        for key in "${!fan_speed_arr[@]}" ; do
+            fan_data+="fan,$key,${fan_speed_arr[$key]}\n"
+        done
+        printf '%b' "$fan_data" > "$fan_cache_file"    
+    done
+}
+# }}}
+
+# Disk {{{
+get_disk_dynamic(){
+    local interval=${1}
+
+    local fs total used available use_percent mount_point
+    while read -r fs total used available use_percent mount_point ; do
+        if [[ "$fs" == /dev/* ]]  ; then
+            disk_sizes_arr["$fs"]="$total"
+            disk_usages_arr["$fs"]="$used"
+            disk_mount_point_arr["$fs"]="$mount_point"
+        fi
+    done < <( df )
+    sleep "$interval"
+}
+disk_daemon(){
+
+    while true ; do
+        get_disk_dynamic 1
+    
+        local disk_data=""
+
+        for key in "${!disk_sizes_arr[@]}" ; do
+            disk_data+="disk_size,$key,${disk_sizes_arr[$key]}\n"
+        done
+        for key in "${!disk_usages_arr[@]}" ; do
+            disk_data+="disk_usage,$key,${disk_usages_arr[$key]}\n"
+        done
+        for key in "${!disk_mount_point_arr[@]}" ; do
+            disk_data+="disk_mount_point,$key,${disk_mount_point_arr[$key]}\n"
+        done
+        printf '%b' "$disk_data" > "$disk_cache_file"    
+    done
+}
+# }}}
+
+# Network {{{
+get_net_dynamic(){
+    local interval=${1}
+    # Link layer
+    local link_out_start="$( ip -o -s link )"
+    sleep "$interval"
+    local link_out_end="$( ip -o -s link )"
+    declare -A down_speed_start
+    declare -A down_speed_end
+    declare -A up_speed_start
+    declare -A up_speed_end
+    local idx dev dev_info mtu mtu_v q_d q_d_v link_state link_state_v rest
+    while read -r idx dev dev_info mtu mtu_v q_d q_d_v link_state link_state_v \
+        rest ; do
+        local dev=${dev%%:}
+        if ! [[ "$dev" == lo ]] ; then
+            if [[ "$dev_info" == *UP* ]] ; then
+                local dev_state="UP"
+            else
+                local dev_state="DOWN"
+            fi
+            net_dev_state["$dev"]="$dev_state"
+            net_link_state["$dev"]="$link_state_v"
+            if [[ "$link_state_v" == "UP" ]] ; then
+                while read -ra arr ; do
+                    for idx in "${!arr[@]}" ; do
+                        if [[ "${arr[$idx]}" == "RX:" ]] ; then
+                            down_speed_start["$dev"]="${arr[$(( idx + 8 ))]}"
+                        fi
+                        if [[ "${arr[$idx]}" == "TX:" ]] ; then
+                            up_speed_start["$dev"]="${arr[$(( idx + 8 ))]}"
+                        fi
+                    done
+                done <<< "$rest"
+            fi
+        fi
+    done <<< "$link_out_start"
+    while read -r idx dev dev_info mtu mtu_v q_d q_d_v link_state link_state_v \
+        rest ; do
+        local dev=${dev%%:}
+        if ! [[ "$dev" == lo ]] ; then
+            if [[ "$link_state_v" == "UP" ]] ; then
+                while read -ra arr ; do
+                    for idx in "${!arr[@]}" ; do
+                        if [[ "${arr[$idx]}" == "RX:" ]] ; then
+                            down_speed_end["$dev"]="${arr[$(( idx + 8 ))]}"
+                        fi
+                        if [[ "${arr[$idx]}" == "TX:" ]] ; then
+                            up_speed_end["$dev"]="${arr[$(( idx + 8 ))]}"
+                        fi
+                    done
+                done <<< "$rest"
+            fi
+        fi
+    done <<< "$link_out_end"
+    for dev in "${!down_speed_start[@]}" ;  do
+        net_down_speed["$dev"]="$(( ( ${down_speed_end[$dev]} - \
+            ${down_speed_start[$dev]}) / interval ))"
+        net_up_speed["$dev"]="$(( ( ${up_speed_end[$dev]} - \
+            ${up_speed_start[$dev]}) / interval ))"
+    done
+    # Network Layer
+    net_ip_addr=()
+    local inet ip
+    while read -r idx dev inet ip rest ; do
+        for d in "${!net_dev_state[@]}" ; do
+            if [[ "$dev" == "$d" ]] ; then
+                if [[ "$ip" == +([[:digit:]./]) ]] ; then
+                    net_ip_addr["$dev"]+="$ip "
+                fi
+            fi
+        done
+    done <  <(ip -o addr)
+    # -----------------
+    net_gate=()
+    local dest via gate dev_v
+    while read -r dest via gate dev dev_v rest ; do
+        for d in "${!net_dev_state[@]}" ; do
+            if [[ "$dev_v" == "$d" ]] ; then
+                if [[ "$dest" == "default" ]]  ; then
+                    dest="0.0.0.0"
+                fi
+                if [[ "$gate" == +([[:digit:]./]) ]] ; then
+                    net_gate["$dev_v"]+="$dest-$gate "
+                fi
+            fi
+        done
+    done < <(ip -o route)
+    # -----------------
+}
+net_daemon(){
+    while true ; do
+        get_net_dynamic 1
+
+        local net_data=""
+
+        for key in "${!net_dev_state[@]}" ; do
+            net_data+="net_dev_state,$key,${net_dev_state[$key]}\n"
+        done
+        for key in "${!net_link_state[@]}" ; do
+            net_data+="net_link_state,$key,${net_link_state[$key]}\n"
+        done
+        for key in "${!net_ip_addr[@]}" ; do
+            net_data+="net_ip_addr,$key,${net_ip_addr[$key]}\n"
+        done
+        for key in "${!net_gate[@]}" ; do
+            net_data+="net_gate,$key,${net_gate[$key]}\n"
+        done
+        for key in "${!net_down_speed[@]}" ; do
+            net_data+="net_down_speed,$key,${net_down_speed[$key]}\n"
+        done
+        for key in "${!net_up_speed[@]}" ; do
+            net_data+="net_up_speed,$key,${net_up_speed[$key]}\n"
+        done
+        printf '%b' "$net_data" > "$net_cache_file"    
+    done
+}
+# }}}
+
+# Logo {{{
+get_height() {
+    local lc=0
+    if [[ -s "$info_cache_file" ]] ; then
+        while read -r line ;  do 
+            ((lc++))
+        # I had to do this because the file is not formatted 
+        # and contains literal newlines, the file is all in one
+        # line and the first char is a '\n', this trips read up
+        done < <( printf '%b' "$(< "$info_cache_file")" )
+        HEIGHT="$(( lc - 2 ))"
+    fi
+}
+plasma_effect(){
+    local x="$1"
+    local y="$2"
+    local W="$3"
+    local H="$4"
+    local t="$5"
+
+    local gradient_ascii=(
+    $'\e[31m \e[0m' 
+    $'\e[91m.\e[0m' 
+    $'\e[32m:\e[0m' 
+    $'\e[92m-\e[0m' 
+    $'\e[33m=\e[0m' 
+    $'\e[93m+\e[0m' 
+    $'\e[34m*\e[0m' 
+    $'\e[94mp\e[0m' 
+    $'\e[35m#\e[0m' 
+    $'\e[95m%\e[0m' 
+    $'\e[36m@\e[0m' 
+    $'\e[96mW\e[0m' 
+    $'\e[37m8\e[0m'
+    $'\e[97mB\e[0m')
+    local g_len=${#gradient_ascii[@]}
+
+    local a=$(( x + t ))
+    local b=$(( y + t ))
+    local c=$(( x + y + t ))
+    
+    local idx1=$(( (a % W) * SIN_DENSITY / W ))
+    local idx2=$(( (b % H) * SIN_DENSITY / H ))
+    local idx3=$(( (c % (W+H)) * SIN_DENSITY / (W+H) ))
+    
+    v1=${SIN_TABLE[$idx1]}
+    v2=${SIN_TABLE[$idx2]}
+    v3=${SIN_TABLE[$idx3]}
+    
+    local value=$(( v1 + v2 + v3 ))
+
+    index=$(( (value + 3 * SIN_RANGE) * g_len / ( 6 * SIN_RANGE ) ))
+    (( index < 0 )) && index=0
+    (( index >= g_len )) && index=$((g_len - 1))
+
+    CHAR="${gradient_ascii[index]}"
+}
+get_points(){
+    local time="$1"
+    for ((x=0; x < WIDTH; x++)) ; do
+        for ((y=0; y < HEIGHT; y++)) ; do
+            vec2_pack "$x" "$y"
+            plasma_effect "$x" "$y" "$WIDTH" "$HEIGHT" "$time"
+            POINTS["$VEC2"]="$CHAR"
+        done
+    done
+}
+get_logo(){
+    for ((y=0; y < HEIGHT; y++)); do
+        for ((x=0; x < WIDTH; x++)); do
+            vec2_pack "$x" "$y"
+            LOGO+="${POINTS["$VEC2"]}${POINTS["$VEC2"]}"
+        done
+        LOGO+=$'\n'
+    done
+}
+draw_borders(){
+    local _logo
+    local horizontal='═'
+    local vertical='║'
+    local corner_tr='╗'
+    local corner_tl='╔'
+    local corner_dr='╝'
+    local corner_dl='╚'
+
+    _logo+="$corner_tl\
+$(for ((i=0;i < WIDTH * 2 ; i++)) ; do printf '%s' "$horizontal" ; done )\
+$corner_tr\n"
+    while IFS= read -r line ; do
+        _logo+="$vertical$line$vertical\n"
+    done <<< "${LOGO%$'\n'}"
+    _logo+="$corner_dl\
+$(for ((i=0;i < WIDTH * 2; i++)) ; do printf '%s' "$horizontal" ; done )\
+$corner_dr\n"
+
+    LOGO="$_logo"
+    LOGO+=$'\n'
+}
+logo_daemon(){
+    declare WIDTH="$logo_width"
+    declare HEIGHT=0
+    declare LOGO=""
+    declare CHAR=''
+    declare -A POINTS
+    local time=0
+    while true ; do 
+        LOGO=''
+        POINTS=()
+        get_height
+        (( "$HEIGHT" <= 0 )) && sleep 1 && continue
+        get_points "$time"
+        get_logo
+        draw_borders
+        printf '%s' "$LOGO" > "$logo_cache_file"
+        ((time++)) 
+        sleep 0.1
+    done
+}
+# }}}
+
+# Gen_Info {{{
+progess_bar() {
+    local current="$1"
+    local total="$2"
+    local bar_count="${3:-40}"
+
+    local percent="$(( current * 100 / total ))"
+    local filled_bars="$(( bar_count * percent / 100 ))" 
+    (( filled_bars == 0 )) && filled_bars=1
+    local empty_bars="$(( bar_count - filled_bars ))" 
+
+    printf '[ '
+    for ((i=0; i < filled_bars; i++)) ; do printf '\e[32m■' ; done
+    for ((i=0; i < empty_bars; i++)) ; do printf '\e[33m─' ; done
+    printf ' \e[0m]'
+}
+fan_anim(){
+    local fan_chars=( '┤' '┴' '├' '┬' )
+    fan_chars=( '  ' '  ' )
+    local t="$1"
+    printf '%s' "${fan_chars[$(( t % ${#fan_chars[@]} ))]}"
+}
+pacman_ani(){
+    pacman_chars=(  
+    '\e[34m ' '\e[34m ' '\e[34m ' '\e[34m '
+    '\e[33m󰮯 '
+    '󰊠 ' '󰊠 ' '󰊠 ' '󰊠 ' '󰊠 ' '󰊠 ' '󰊠 ' 
+    '󰊠 ' '󰊠 ' '󰊠 ' '󰊠 ' '󰊠 ' '󰊠 ' '󰊠 ' 
+    )
+    local t="$1"
+    printf '%s' "${pacman_chars[$(( -t % ${#pacman_chars[@]} ))]}"
+}
+arrow_anim(){
+    arrow_chars=(  
+        '>   ' '->  ' ' -> ' '  ->' '   -'
+    )
+    local t="$1"
+    printf '%s' "${arrow_chars[$(( t % ${#arrow_chars[@]} ))]}"
+}
+info_daemon() {
+    local anim_time=0
+
+    while true ; do
+        # ---------------------
+        local info=""
+        info+="\e[1;90;40m\e[1;34;100m\e[1;30;44m\
+$(whoami)\e[1;34;100m\e[1;90;40m\e[0m\n\n"
+        # ---------------------
+        local key value
+        IFS='"' read -r key value < "/etc/os-release"
+        info+="┌(\e[35mOS\e[0m) $value\n"
+        # ---------------------
+        info+="├(\e[35mKernel\e[0m) $(uname -r)\n"
+        # ---------------------
+        info+="├(\e[35mShell\e[0m) ${SHELL}\n"
+        # ---------------------
+        get_wm() {
+            local socket="${XDG_RUNTIME_DIR}/${WAYLAND_DISPLAY:-wayland-0}"
+            local wm
+
+            if [[ -S $socket ]]; then
+                local pid
+                pid=$(lsof -t "$socket" 2>/dev/null || \
+                    fuser "$socket" 2>/dev/null)
+
+                [[ $pid ]] && wm=$(ps -p "$pid" -o comm=)
+            elif [[ $DISPLAY ]] && command -v xprop >/dev/null; then
+                local id
+                id=$(xprop -root -notype _NET_SUPPORTING_WM_CHECK 2>/dev/null)
+                id=${id##* }
+                wm=$(xprop \
+                    -id "$id" -notype -len 100 -f _NET_WM_NAME 8t 2>/dev/null)
+                wm=${wm#*WM_NAME = }
+                wm=${wm//\"}
+            fi
+            wm=${wm:-unknown}
+
+            printf '%s' "$wm"
+        }
+        info+="├(\e[35mWM\e[0m) $(get_wm)\n"
+        # -----------------------
+        local up_sec
+        IFS=. read -r up_sec rest < "/proc/uptime"
+        local uptime_H uptime_M uptime_S
+        uptime_H="$( printf '%02d' $(( up_sec / 3600 )))"
+        uptime_M="$( printf '%02d' $(( up_sec % 3600 / 60 )))"
+        uptime_S="$( printf '%02d' $(( up_sec % 3600 % 60 )))"
+        local uptime="$uptime_H:$uptime_M:$uptime_S"
+        info+="└(\e[35mUptime\e[0m) ${uptime}\n"
+        # ----------------------
+        info+="\n\e[1;90;40m\e[1;34;100m\e[1;30;44m\
+$(< "/etc/hostname")\e[1;34;100m\e[1;90;40m\e[0m\n\n"
+        # -----------------------
+        local cpu cpu_count cpu_temp cpu_temp_color cpu_usage cpu_usage_color
+        local cpu_speed cpu_speed_min cpu_speed_max cpu_speed_color
+        if [[ -s "$cpu_cache_file" ]] ; then
+            while IFS=, read -r key value ; do
+                case "$key" in
+                    cpu) cpu="$value" ;;
+                    cpu_count) cpu_count="$value" ;;
+                    cpu_speed_min) cpu_speed_min="$value" ;;
+                    cpu_speed_max) cpu_speed_max="$value" ;;
+                    cpu_speed) cpu_speed="$value" 
+                        (( value >= cpu_speed_min )) && cpu_speed_color="\e[32m"
+
+                        local range=$(( cpu_speed_max - cpu_speed_min ))
+                        local threshold=$(( (range * 60 / 100) + cpu_speed_min ))
+                        (( value > threshold  )) && cpu_speed_color="\e[33m"
+
+                        range=$(( cpu_speed_max - cpu_speed_min ))
+                        threshold=$(( (range * 80 / 100) + cpu_speed_min ))
+                        (( value > threshold )) && cpu_speed_color="\e[31m"
+                        ;;
+                    cpu_usage) cpu_usage="$value" 
+                        (( value >= 0 )) && cpu_usage_color="\e[32m"
+                        (( value > 60 )) && cpu_usage_color="\e[33m"
+                        (( value > 80 )) && cpu_usage_color="\e[31m"
+                        ;;
+                    cpu_temp) 
+                        cpu_temp="$value"
+                        (( value >= 0 )) && cpu_temp_color="\e[32m"
+                        (( value > 60 )) && cpu_temp_color="\e[33m"
+                        (( value > 80 )) && cpu_temp_color="\e[31m"
+                        ;;
+                esac
+            done < "$cpu_cache_file"
+        info+="┌(\e[35mcpu\e[0m) ${cpu} (\e[31m${cpu_count}\e[0m) \
+[$cpu_temp_color$cpu_temp°C\e[0m]\n"
+        info+="│ $( progess_bar $(( cpu_usage / 10 )) 100 ) \
+($cpu_usage_color$(( cpu_usage / 10 )).$(( cpu_usage % 10 ))%\e[0m)\n"
+        info+="│ $(progess_bar $(( cpu_speed - cpu_speed_min )) \
+$(( cpu_speed_max - cpu_speed_min ))) \
+[\e[35m$cpu_speed_min\
+/$cpu_speed_color$cpu_speed\e[0m/\e[35m$cpu_speed_max Mhz\e[0m]\n"
+        fi
+        # -----------------------
+        local pcie_bus_id
+        declare -A gpu gpu_temp_arr gpu_temp_col_arr gpu_usage_arr \
+            gpu_usage_col_arr total_vram_arr vram_usage_arr \
+            vram_usage_col_arr
+        if [[ -s "$gpu_cache_file" ]] ; then
+            while IFS=, read -r key pcie_bus_id value ; do
+                case "$key" in 
+                    gpu) gpu["$pcie_bus_id"]="$value" ;;
+                    gpu_temp) 
+                        gpu_temp_arr["$pcie_bus_id"]="$value" 
+                        (( value >= 0 )) && \
+                            gpu_temp_col_arr["$pcie_bus_id"]="\e[32m"
+                        (( value > 60 )) && \
+                            gpu_temp_col_arr["$pcie_bus_id"]="\e[33m"
+                        (( value > 80 )) && \
+                            gpu_temp_col_arr["$pcie_bus_id"]="\e[31m"
+                        ;;
+                    gpu_usage) 
+                        gpu_usage_arr["$pcie_bus_id"]="$value" 
+                        (( value >= 0 )) && \
+                            gpu_usage_col_arr["$pcie_bus_id"]="\e[32m"
+                        (( value > 60 )) && \
+                            gpu_usage_col_arr["$pcie_bus_id"]="\e[33m"
+                        (( value > 80 )) && \
+                            gpu_usage_col_arr["$pcie_bus_id"]="\e[31m"
+                        ;;
+                    total_vram) 
+                        total_vram_arr["$pcie_bus_id"]="$value" 
+                        ;;
+                    vram_usage) 
+                        vram_usage_arr["$pcie_bus_id"]="$value" 
+                        (( value >= 0 )) && \
+                            vram_usage_col_arr["$pcie_bus_id"]="\e[32m"
+                (( value > ( ${total_vram_arr[$pcie_bus_id]} * 60 / 100 ) )) && \
+                            vram_usage_col_arr["$pcie_bus_id"]="\e[33m"
+                (( value > ( ${total_vram_arr[$pcie_bus_id]} * 80 / 100 ) )) && \
+                            vram_usage_col_arr["$pcie_bus_id"]="\e[31m"
+                        ;;
+                esac
+            done < "$gpu_cache_file"
+
+        for pcie_bus_id in "${!gpu[@]}" ; do 
+            if [[ "${gpu_temp_arr[$pcie_bus_id]}" ]] ; then
+            info+="├(\e[35mgpu\e[0m) \
+${gpu[$pcie_bus_id]} [\e[31m${pcie_bus_id}\e[0m] \
+[${gpu_temp_col_arr[$pcie_bus_id]}${gpu_temp_arr[$pcie_bus_id]}°C\e[0m]\n"
+            else
+            info+="├(\e[35mgpu\e[0m) \
+${gpu[$pcie_bus_id]} [\e[31m${pcie_bus_id}\e[0m]\n"
+            fi
+
+            if [[ "${gpu_usage_arr[$pcie_bus_id]}" ]] ; then
+            info+="│ $( progess_bar "${gpu_usage_arr[$pcie_bus_id]}" 100 ) \
+(${gpu_usage_col_arr[$pcie_bus_id]}${gpu_usage_arr[$pcie_bus_id]}%\e[0m)\n"
+            fi
+
+            if [[ "${total_vram_arr[$pcie_bus_id]}" && "${vram_usage_arr[$pcie_bus_id]}" ]] ; then 
+            info+="│ $( progess_bar "${vram_usage_arr[$pcie_bus_id]}" \
+"${total_vram_arr[$pcie_bus_id]}" ) \
+[${vram_usage_col_arr[$pcie_bus_id]}${vram_usage_arr[$pcie_bus_id]}/\
+\e[35m${total_vram_arr[$pcie_bus_id]} MiB\e[0m]\n"
+             fi
+        done
+
+        fi
+        # -----------------------
+        local total_memory memory_used memory_used_col
+        if [[ -s "$memory_cache_file" ]] ; then
+            while IFS=, read -r key value ; do
+                case "$key" in 
+                    total_memory) total_memory="$value" ;;
+                    memory_used) 
+                        memory_used="$value" 
+                        (( value >= 0 )) && memory_used_col="\e[32m"
+                        (( value > ( total_memory  * 50 / 100 ) )) && \
+                                memory_used_col="\e[33m"
+                        (( value > ( total_memory  * 80 / 100 ) )) && \
+                                memory_used_col="\e[31m"
+                        ;;
+                esac
+            done < "$memory_cache_file"
+            info+="├(\e[35mmem\e[0m) \n"
+        info+="│ $( progess_bar "$memory_used" "$total_memory" ) \
+($memory_used_col$(( memory_used * 100 / total_memory ))%\e[0m) \
+[$memory_used_col$( printf '%0.2f' "$(( memory_used / (1024 * 1024) )).\
+$(( (memory_used % (1024 * 1024)) * 100 / ( 1024 * 1024 ) ))" )/\e[35m\
+$( printf '%0.2f' "$(( total_memory / (1024 * 1024) )).\
+$(( (total_memory % (1024 * 1024)) * 100 / ( 1024 * 1024 ) ))" ) GiB\e[0m]\n"
+        fi
+        # -----------------------
+        declare -A fan_speed_arr
+        if [[ -s "$fan_cache_file" ]] ; then
+            while IFS=, read -r key name value ; do
+                case "$key" in
+                    fan) fan_speed_arr["$name"]="$value" ;;
+                esac
+            done < "$fan_cache_file" 
+            info+="├(\e[35mfan\e[0m) "
+            for speed in "${fan_speed_arr[@]}" ; do
+                info+="[\e[36m$( fan_anim "$anim_time" )\e[0m] $speed Rpm "
+            done
+            info+="\n"
+        fi
+        # -----------------------
+        declare -A disk_sizes_arr disk_mount_point_arr \
+            disk_usages_arr disk_usages_col_arr
+        if [[ -s "$disk_cache_file" ]] ; then
+            while IFS=, read -r key name value ; do
+                case "$key" in
+                disk_size) disk_sizes_arr["$name"]="$value" ;;
+                disk_mount_point) disk_mount_point_arr["$name"]="$value" ;;
+                disk_usage) 
+                    disk_usages_arr["$name"]="$value" 
+                    (( value >= 0 )) && disk_usages_col_arr["$name"]="\e[32m"
+                    (( value > ( ${disk_sizes_arr[$name]}  * 60 / 100 ) )) && \
+                            disk_usages_col_arr["$name"]="\e[33m"
+                    (( value > ( ${disk_sizes_arr[$name]}  * 80 / 100 ) )) && \
+                            disk_usages_col_arr["$name"]="\e[31m"
+                    ;;
+                esac
+            done < "$disk_cache_file" 
+
+            for disk in "${!disk_sizes_arr[@]}" ; do
+                info+="├(\e[35m$disk\e[0m) "
+                info+="[\e[32m${disk_mount_point_arr[$disk]}\e[0m]\n"
+                info+="│ $( progess_bar "${disk_usages_arr[$disk]}" \
+"${disk_sizes_arr[$disk]}" ) \
+[${disk_usages_col_arr[$disk]}\
+$( printf "%.2f" "$(( ${disk_usages_arr[$disk]} / (1024 * 1024) ))\
+.$(( ${disk_usages_arr[$disk]} % (1024 * 1024) ))" )/\
+\e[35m$( (( (${disk_sizes_arr[$disk]} / (1024 * 1024)) == 0 )) && \
+printf "%d" "1" || printf "%d" "$(( ${disk_sizes_arr[$disk]} / (1024 * 1024)  ))"\
+) GiB\e[0m]\n"
+            done
+        fi
+        # -----------------------
+        declare -A net_dev_state net_link_state net_ip_addr net_gate \
+            net_down_speed net_up_speed
+        if [[ -s "$net_cache_file" ]] ; then
+            while IFS=, read -r key name value ; do
+                case "$key" in
+                net_dev_state) net_dev_state["$name"]="$value" ;;
+                net_link_state) net_link_state["$name"]="$value" ;;
+                net_ip_addr) net_ip_addr["$name"]="$value" ;;
+                net_gate) net_gate["$name"]="$value" ;;
+                net_down_speed) net_down_speed["$name"]="$value" ;;
+                net_up_speed) net_up_speed["$name"]="$value" ;;
+                esac
+            done < "$net_cache_file" 
+            for dev in "${!net_dev_state[@]}" ; do
+                info+="├(\e[35m$dev\e[0m) \
+$([[ "${net_dev_state[$dev]}" == "UP" ]] && printf '[\e[32m%s\e[0m]' "UP"\
+|| printf '[\e[31m%s\e[0m]' "DOWN" ) \
+$([[ "${net_link_state[$dev]}" == "UP" ]] && printf '[\e[32m%s\e[0m]' "UP"\
+|| printf '[\e[31m%s\e[0m]' "DOWN" )"
+                for _dev in "${!net_ip_addr[@]}" ; do
+                    if [[ "$dev" == "$_dev" ]] ; then
+                        while IFS= read -d ' ' -r addr ; do 
+                            info+=" (\e[34m$addr\e[0m)"
+                        done <<< "${net_ip_addr[$dev]}"
+                    fi
+                done
+                for _dev in "${!net_down_speed[@]}" ; do
+                    if [[ "$dev" == "$_dev" ]] ; then
+                        info+=" \e[35m $(( ${net_down_speed[$_dev]} / 1024 )) \
+KiB  $(( ${net_up_speed[$_dev]} / 1024 )) KiB \e[0m"
+                    fi
+                done
+                info+="\n"
+                for _dev in "${!net_gate[@]}" ; do
+                    if [[ "$dev" == "$_dev" ]] ; then
+                        while IFS= read -d ' ' -r dest_gate ; do 
+                            while IFS='-' read -r dest gate ; do 
+                                info+="│ [\e[33m$dest\e[0m]\
+$(arrow_anim "$anim_time")[\e[32m$gate\e[0m]\n"
+                            done <<< "${dest_gate}"
+                        done <<< "${net_gate[$dev]}"
+                    fi
+                done
+            done
+        fi
+        # -----------------------
+        info+="└(\e[35mcol\e[0m) \
+\e[31m$( pacman_ani "$anim_time" ) \
+\e[32m$( pacman_ani "$((anim_time - 1 ))" ) \
+\e[33m$( pacman_ani "$((anim_time - 2))" ) \
+\e[34m$( pacman_ani "$((anim_time - 3))" ) \
+\e[35m$( pacman_ani "$((anim_time - 4))" ) \
+\e[36m$( pacman_ani "$((anim_time - 5))" ) \
+\e[37m$( pacman_ani "$((anim_time - 6))" ) \
+\e[90m$( pacman_ani "$((anim_time - 7))" ) \
+\e[91m$( pacman_ani "$((anim_time - 8))" ) \
+\e[92m$( pacman_ani "$((anim_time - 9))" ) \
+\e[93m$( pacman_ani "$((anim_time - 10))" ) \
+\e[94m$( pacman_ani "$((anim_time - 11))" ) \
+\e[95m$( pacman_ani "$((anim_time - 12))" ) \
+\e[96m$( pacman_ani "$((anim_time - 13))" ) \
+\e[97m$( pacman_ani "$((anim_time - 14))" ) \
+\e[0m"
+        (( anim_time++ ))
+        info+="\n"
+        printf '%s' "$info" > "$info_cache_file"
+        sleep 0.3
+    done
+}
+# }}}
+
+# Assembler {{{
+assembler_daemon(){
+    while true ; do
+        declare -a logo_arr
+        declare -a info_arr
+        local frame=''
+        local idx=0
+        if [[ -s "$logo_cache_file" && -s "$info_cache_file" ]] ; then
+            while IFS= read -r line ; do 
+                logo_arr["$idx"]="$line"
+                ((idx++))
+            done < <( printf '%b' "$(< "$logo_cache_file")" ) 
+            idx=0
+            while IFS= read -r line ; do 
+                info_arr["$idx"]="$line"
+                ((idx++))
+            done < <( printf '%b' "$(< "$info_cache_file")" ) 
+            for i in "${!info_arr[@]}" ; do 
+                frame+="${logo_arr[$i]} ${info_arr[$i]}\n"
+            done
+        fi
+        printf '%b' "$frame" > "$frame_cache_file"
+        sleep 0.1
+    done
+}
+# }}}
+
+# Draw {{{
+draw(){
+    vec2_unpack "$CURSOR_POS"
+    # scroll to have a clean full screen
+    printf '\e[%iS' "$Y"
+    # move up the cursor the same amount
+    printf '\e[%iA' "$Y"
+    # Anchor the cursor
+    printf '\e[s'
+    while true ; do
+        # calculate frame height, used in DEINIT(), irrelevent in this func
+        local lc=0
+        while IFS= read -r line ; do ((lc++)) ; done < "$frame_cache_file"
+        ((lc > frame_height)) && frame_height="$lc"
+        printf '%i' "$frame_height" > "$frame_height_cache_file"
+        # ----------------------------------
+
+        if [[ -s "$frame_cache_file" ]] ; then
+            # clean till the end of screen 
+            printf '\e[0J'
+            # Print frame
+            while IFS= read -r line ; do
+                printf "%b\n" "$line"
+            done < "$frame_cache_file"
+            # Move cursor to Anchor
+            printf '\e[u'
+        fi
+        sleep 0.1
+    done
+}
+# }}}
+
+# Hooks {{{
+DEINIT(){
+    # Move cursor to the end of the output
+    local frame_height
+    frame_height="$(< "$frame_height_cache_file")"
+    printf '\e[%iB' "$frame_height"
+    # Unhide cursor
+    printf "\e[?25h"
+    # Kill daemons
+    for pid in "${daemon_PID_arr[@]}" ; do
+        kill "$pid" 2> /dev/null
+        wait "$pid" 2> /dev/null
+    done
+    # Remove caches
+    local cache
+    for cache in "$cache_files"* ; do
+        rm -rf "$cache" 2> /dev/null
+    done
+    # restore ^C printing
+    stty echoctl
+}
+INIT() {
+    # check for other instances
+    for cache in "$cache_files"* ; do
+        [[ -s "$cache" ]] && \
+            printf '%b' '\e[32m*\e[0m An instance is already running...\n' && \
+            exit 1
+    done
+    # Hide cursor
+    printf "\e[?25l"
+    # diable ^C printing
+    stty -echoctl
+
+    get_cursor_pos
+}
+# }}}
+
+# Parsing Args {{{
+
+print_help() {
+    local help_text
+    read -d '' -r help_text <<EOF
+\e[32musage:\e[0m soulfetch [\e[31m-h\e[0m] [\e[31m-l <int>\e[0m]
+
+\e[32msoulfetch\e[0m -  fetches thy soul
+
+\e[32moptions:\e[0m
+    \e[35m-h, --help\e[0m          show help massage
+    \e[35m-w, --logo_width\e[0m    set the width of the logo. (default:8)
+EOF
+    printf "%b\n" "$help_text"
+}
+
+PARSED_OPTS=$( getopt -o hw: \
+    --long "help,logo_width" \
+    -n 'soulfetch' \
+    -- "$@" || exit 1 ) \
+
+eval set -- "$PARSED_OPTS"
+
+while true; do
+    case "$1" in
+        -h | --help) print_help ; exit 0 ;;
+        -w | --logo_width) logo_width="$2" ; shift 2 ;;
+        --) shift ; break ;;
+        *) exit 1 ;;
+    esac
+done
+
+# }}}
+
+INIT
+trap DEINIT exit 
+cpu_daemon 2> /dev/null & daemon_PID_arr+=( $! ) 
+memory_daemon 2> /dev/null & daemon_PID_arr+=( $! ) 
+gpu_daemon 2> /dev/null & daemon_PID_arr+=( $! )
+fan_daemon 2> /dev/null & daemon_PID_arr+=( $! )
+disk_daemon 2> /dev/null & daemon_PID_arr+=( $! )
+info_daemon 2> /dev/null & daemon_PID_arr+=( $! )
+net_daemon 2> /dev/null & daemon_PID_arr+=( $! )
+logo_daemon 2> /dev/null & daemon_PID_arr+=( $! )
+assembler_daemon 2> /dev/null & daemon_PID_arr+=( $! )
+draw 2> /dev/null & daemon_PID_arr+=( $! )
+while true ; do sleep 0.1 ; done
