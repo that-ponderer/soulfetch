@@ -22,7 +22,9 @@ Dependencies:
 # Note: only intel and nvidia gpu are supported.
 # Core utils are required.
 # External utils are optional, install the ones you need.
-# 
+
+bash # duh
+
 # External Utils: 
 nvidia-smi # from: nvidia-utils, for nvidia gpu support
 intel_gpu_top # from: intel-gpu-tools, for intel gpu support
