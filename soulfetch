@@ -937,7 +937,7 @@ $(whoami)\e[1;34;100m\e[1;90;40m\e[0m\n\n"
                 wm=${wm//\"}
             fi
             if [[ -z "$wm" ]] ; then
-                wm=$(ps | grep -m 1 -o -F \
+                wm=$(ps ax | grep -m 1 -o -F \
                                    -e arcan \
                                    -e asc \
                                    -e clayland \
