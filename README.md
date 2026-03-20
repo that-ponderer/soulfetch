@@ -29,7 +29,6 @@ intel_gpu_top # from: intel-gpu-tools, for intel gpu support
 nerd-fonts (any variant) # glyphs used in animations
 
 # Core utils (most likely already installed):
-
 lspci
 getcap 
 tail 
