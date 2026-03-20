@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
-# ext utilities: lspci nvidia-smi intel_gpu_top getcap setcap sudo tail df 
-# which mkdir sleep lsof fuser ps xprop uname whoami rm kill ip
+# ext utilities: lspci nvidia-smi intel_gpu_top getcap tail df 
+# which mkdir sleep lsof fuser ps xprop uname whoami rm kill ip getopt stty ps
 
 shopt -s extglob nullglob checkwinsize
 
@@ -936,6 +936,41 @@ $(whoami)\e[1;34;100m\e[1;90;40m\e[0m\n\n"
                 wm=${wm#*WM_NAME = }
                 wm=${wm//\"}
             fi
+            if [[ -z "$wm" ]] ; then
+                wm=$(ps | grep -m 1 -o -F \
+                                   -e arcan \
+                                   -e asc \
+                                   -e clayland \
+                                   -e dwc \
+                                   -e fireplace \
+                                   -e gnome-shell \
+                                   -e greenfield \
+                                   -e grefsen \
+                                   -e hikari \
+                                   -e kwin \
+                                   -e lipstick \
+                                   -e maynard \
+                                   -e mazecompositor \
+                                   -e motorcar \
+                                   -e orbital \
+                                   -e orbment \
+                                   -e perceptia \
+                                   -e river \
+                                   -e rustland \
+                                   -e sway \
+                                   -e ulubis \
+                                   -e velox \
+                                   -e wavy \
+                                   -e way-cooler \
+                                   -e wayfire \
+                                   -e wayhouse \
+                                   -e westeros \
+                                   -e westford \
+                                   -e weston)
+            fi
+            # Rename window managers to their proper values.
+            [[ $wm == *WINDOWMAKER* ]] && wm=wmaker
+            [[ $wm == *GNOME*Shell* ]] && wm=Mutter
             wm=${wm:-unknown}
 
             printf '%s' "$wm"
