@@ -38,8 +38,7 @@ df
 which 
 mkdir 
 sleep 
-lsof 
-fuser 
+lsof # or fuser 
 ps 
 xprop 
 uname 
